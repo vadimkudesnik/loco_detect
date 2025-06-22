@@ -10,9 +10,10 @@ import asyncio
 import json
 import signal
 
+import cv2
+import numpy as np
 import requests
 import websockets
-from websockets.asyncio.server import serve
 
 # Строка с адресом websocket соединения с ТТК сервером
 uri_ws = "wss://b2b.videoportal.ttk.ru/ws?auth_token="
@@ -60,13 +61,17 @@ json_camera_stop_string = (
 """
 )
 
+height = 576
+width = 704
+
 
 # функция получения сообщений от ТТК сервера и передачи их на клиент
 async def receive_messages(
     websocket: websockets.ClientConnection,  # соединение с ТТК
-    websocket_out: websockets.ServerConnection,  # соединение с клиентом
+    process: asyncio.subprocess.Process,
 ) -> None:
     print("Запуск процесса получения сообщений от ТТК")
+    assert isinstance(process.stdin, asyncio.StreamWriter)
     while True:
         try:
             message = await websocket.recv(False)  # Получаем сообщение от ТТК
@@ -79,9 +84,8 @@ async def receive_messages(
                 # )  # Записываем в конец полученное сообщение без заголовка
                 # binary_file.close()  # Закрываем файл
                 # ------------------------
-                await websocket_out.send(
-                    message[47:]
-                )  # Отправляем клиенту полученное сообщение без заголовка
+                process.stdin.write(message[47:])
+                await process.stdin.drain()
 
         except asyncio.CancelledError:
             print("Процесс получения сообщений от ТТК отменен")
@@ -93,6 +97,49 @@ async def receive_messages(
             print(f"Процесс получения сообщений от ТТК получил ошибку: {e}")
             await send_stop_messages(websocket)
             break
+    if process.stdin.can_write_eof():
+        process.stdin.write_eof()
+
+    process.stdin.close()
+    await process.stdin.wait_closed()
+
+
+async def reader(
+    process: asyncio.subprocess.Process,
+) -> None:
+    assert isinstance(process.stdout, asyncio.StreamReader)
+    print("Запуск процесса формирования изображений")
+    index = 0
+    while True:
+        try:
+            # Read raw video frame from stdout as bytes array.
+            in_bytes = await process.stdout.readexactly(height * width * 3)
+
+            if not in_bytes:
+                break  # Break loop if no more bytes.
+            else:
+                # Transform the byte read into a NumPy array
+                try:
+                    in_frame = np.frombuffer(in_bytes, np.uint8).reshape(
+                        [height, width, 3]
+                    )
+                    #  o.flush()
+                    cv2.imwrite("frames/frame-" + str(index) + ".jpg", in_frame)
+                    index += 1
+                except Exception as e:
+                    print(e)
+                    pass
+        except asyncio.CancelledError:
+            process.kill()
+            await process.wait()
+            process._transport.close()
+            print("Процесс формирования изображений отменен")
+            break
+        except Exception as e:
+            print(f"Процесс формирования изображений получил ошибку: {e}")
+    process.stdout.close()
+    await process.stdout.wait_closed()
+    print("OUT Exit")
 
 
 # функция отправки стартового сообщения на сервер ТТК
@@ -127,7 +174,7 @@ async def send_stop_messages(websocket: websockets.ClientConnection) -> None:
 
 
 # Оснавная функция транскоддера
-async def process_video(websocket_out: websockets.ServerConnection) -> None:
+async def process_video() -> None:
     try:
         print("Начало запуска процесса транскоддирования")
         print("Получение токена от сервера ТТК")
@@ -140,15 +187,58 @@ async def process_video(websocket_out: websockets.ServerConnection) -> None:
                 uri_ws + json_data["token_value"]
             ) as websocket:
                 print("Подключение к серверу ТТК осуществлено")
+                process_ffmpeg = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-probesize",
+                    "250K",
+                    "-analyzeduration",
+                    "1M",
+                    "-f",
+                    "mp4",
+                    "-c:v",
+                    "h264",
+                    "-re",
+                    "-i",
+                    "pipe:0",
+                    "-b:v",
+                    "1000k",
+                    "-vf",
+                    "setrange=limited",
+                    "-f",
+                    "rawvideo",
+                    "-c:v",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "bgr24",
+                    "-s:v",
+                    "704x576",
+                    "-r",
+                    "25",
+                    "-n",
+                    "-an",
+                    "-movflags",
+                    "frag_keyframe+empty_moov+faststart+default_base_moof",
+                    "pipe:1",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                )
                 receive_task = asyncio.create_task(
-                    receive_messages(websocket, websocket_out)
+                    receive_messages(websocket, process_ffmpeg)
                 )  # Создаем задачу по получению сообщений
+
+                response_task = asyncio.create_task(
+                    reader(process_ffmpeg)
+                )  # Создаем задачу по получению сообщений
+
                 print("Запускаем процесс обмена сообщениями")
                 try:
                     await send_messages(websocket)  # Отправляем стартовое сообщение
                     print("Процесс обмена сообщениями запущен")
                     await asyncio.gather(
-                        receive_task, return_exceptions=True
+                        receive_task, response_task, return_exceptions=True
                     )  # Запускаем задачу по получению сообщений
                     print("Получение сообщений от сервера ТТК остановлено")
                     print("Запускаем процесс остановки сервера")
@@ -162,35 +252,33 @@ async def process_video(websocket_out: websockets.ServerConnection) -> None:
                     print("Все задачи удалены")
                 except asyncio.CancelledError:
                     await websocket.close()
-                    await websocket_out.close()
+
                     print("Получение сообщений от сервера ТТК отменено")
                 except Exception as e:
                     await websocket.close()
-                    await websocket_out.close()
+
                     print(f"Ошибка получения сообщений от сервера ТТК: {e}")
         except asyncio.CancelledError:
             await websocket.close()
-            await websocket_out.close()
+
             print("Процесс транскодирования сообщений отменен")
         except Exception as e:
             await websocket.close()
-            await websocket_out.close()
+
             print(f"Процесс транскодирования сообщений получил ошибку: {e}")
     except asyncio.CancelledError:
         await websocket.close()
-        await websocket_out.close()
+
         print("Процесс транскодирования сообщений отменен")
     except Exception as e:
         await websocket.close()
-        await websocket_out.close()
+
         print(f"Процесс транскодирования сообщений получил ошибку: {e}")
 
 
 async def main() -> None:
     try:
-        stop = asyncio.get_running_loop().create_future()
-        async with serve(process_video, "localhost", 8765):
-            await stop
+        await process_video()
 
     except asyncio.CancelledError:
         print("Приложение остановлено")
