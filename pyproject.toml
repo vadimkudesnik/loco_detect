@@ -3,6 +3,7 @@ name = "loco-detect"
 version = "0.1.0"
 description = "LocoTech video detection system"
 readme = "README.md"
+license = "LICENSE.md"
 requires-python = ">=3.12"
 dependencies = [
     "av>=14.4.0",
