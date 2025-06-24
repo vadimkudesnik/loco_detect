@@ -8,6 +8,8 @@
 
 import asyncio
 import json
+import os
+import shutil
 import signal
 
 import cv2
@@ -109,6 +111,15 @@ async def reader(
 ) -> None:
     assert isinstance(process.stdout, asyncio.StreamReader)
     print("Запуск процесса формирования изображений")
+    # тут надо прописать очистку папки frames
+    if os.path.exists("frames"):
+        shutil.rmtree("frames")
+    os.makedirs("frames", exist_ok=True)
+    # Создаем папку для сохранения кадров
+    try:
+        os.makedirs("frames")
+    except FileExistsError:
+        pass
     index = 0
     while True:
         try:
@@ -131,15 +142,15 @@ async def reader(
                     pass
         except asyncio.CancelledError:
             process.kill()
-            await process.wait()
-            process._transport.close()
+            try:
+                await process.wait()
+            except TimeoutError:
+                print("Вызов ffpeg не может завершиться")
             print("Процесс формирования изображений отменен")
             break
         except Exception as e:
             print(f"Процесс формирования изображений получил ошибку: {e}")
-    process.stdout.close()
-    await process.stdout.wait_closed()
-    print("OUT Exit")
+    print("Процесс формирования изображений завершен")
 
 
 # функция отправки стартового сообщения на сервер ТТК
