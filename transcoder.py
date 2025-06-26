@@ -8,14 +8,24 @@
 
 import asyncio
 import json
-import os
-import shutil
+import pickle
 import signal
+import uuid
 
 import cv2
 import numpy as np
 import requests
 import websockets
+
+params_read = "parameters.pickled"
+try:
+    with open(params_read, "rb") as in_file:
+        parameters = pickle.load(in_file)
+except FileNotFoundError:
+    print(
+        f"Файл {params_read} не найден. Пожалуйста, создайте файл с параметрами или используйте другой файл."
+    )
+    exit(1)
 
 # Строка с адресом websocket соединения с ТТК сервером
 uri_ws = "wss://b2b.videoportal.ttk.ru/ws?auth_token="
@@ -27,13 +37,17 @@ url_login = "https://b2b.videoportal.ttk.ru/v1/authentication/authenticate_ex2"
 login_data = {"user_name": "vek", "password": "Fz-25_Vek*"}
 
 # Строка с ID для камеры
-streamId = "61372ee3-0ac3-8b46-2b57-1febbd783b2a"
+streamId = str(uuid.uuid4())  # Uncomment this line to generate a new UUID each time
 
 # Шаблон сообщения для сервера ТТК для запуска потока
 json_camera_string = (
     """
 {
-    "endpoint": "SERVER1/DeviceIpint.125/SourceEndpoint.video:0:1",
+    "endpoint": """
+    + '"'
+    + str(parameters["endpoint"])
+    + '"'
+    + """,
     "format": "mp4",
     "method": "play",
     "streamId": """
@@ -52,19 +66,19 @@ json_camera_string = (
 json_camera_stop_string = (
     """
 {
-    "method": "stop", 
+    "method": "stop",
     "streamId": """
     + '"'
     + streamId
     + '"'
-    + """, 
+    + """,
     "format": "mp4"
 }
 """
 )
 
-height = 576
-width = 704
+height = int(str(parameters["height"]))
+width = int(str(parameters["width"]))
 
 
 # функция получения сообщений от ТТК сервера и передачи их на клиент
@@ -111,16 +125,8 @@ async def reader(
 ) -> None:
     assert isinstance(process.stdout, asyncio.StreamReader)
     print("Запуск процесса формирования изображений")
-    # тут надо прописать очистку папки frames
-    if os.path.exists("frames"):
-        shutil.rmtree("frames")
-    os.makedirs("frames", exist_ok=True)
-    # Создаем папку для сохранения кадров
-    try:
-        os.makedirs("frames")
-    except FileExistsError:
-        pass
     index = 0
+    backSub = cv2.createBackgroundSubtractorMOG2(1000, 25, True)
     while True:
         try:
             # Read raw video frame from stdout as bytes array.
@@ -134,9 +140,61 @@ async def reader(
                     in_frame = np.frombuffer(in_bytes, np.uint8).reshape(
                         [height, width, 3]
                     )
-                    #  o.flush()
-                    cv2.imwrite("frames/frame-" + str(index) + ".jpg", in_frame)
+                    frame_out = in_frame.copy()
+                    frame_mid = in_frame.copy()
+                    start_point = (int(width / 2), 0)
+
+                    # Ending coordinate, here (220, 220)
+                    # represents the bottom right corner of rectangle
+                    end_point = (int(width), 100)
+
+                    # Blue color in BGR
+                    color = (255, 225, 225)
+                    cv2.rectangle(frame_mid, start_point, end_point, color, -1)
+                    fg_mask = backSub.apply(frame_mid)
+                    retval, mask_thresh = cv2.threshold(
+                        fg_mask, height / 20, height / 2, cv2.THRESH_BINARY
+                    )
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                    mask_eroded = cv2.morphologyEx(mask_thresh, cv2.MORPH_OPEN, kernel)
+                    contours, hierarchy = cv2.findContours(
+                        mask_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    min_contour_area = height / 10  # Define your minimum area threshold
+                    large_contours = [
+                        cnt
+                        for cnt in contours
+                        if cv2.contourArea(cnt) > min_contour_area
+                    ]
+                    for cnt in large_contours:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        cv2.rectangle(frame_out, (x, y), (x + w, y + h), (0, 0, 255), 1)
+                    if large_contours:
+                        cv2.rectangle(
+                            frame_out, (0, 0), (width, height), (0, 0, 255), 3
+                        )
+
+                    # cv2.putText(
+                    #    frame_out,
+                    #    "Status: {}".format(
+                    #        "Движение" if large_contours else "Спокойно"
+                    #    ),
+                    #    (10, 20),
+                    #    cv2.FONT_HERSHEY_COMPLEX,
+                    #    1,
+                    #    (0, 0, 255),
+                    #    1,
+                    #    cv2.LINE_4,
+                    # )  # вставляем текст
+                    # cv2.imwrite("frames/frame-" + str(index) + ".jpg", frame_out)
                     index += 1
+                    cv2.imshow("Image", frame_out)
+                    # cv2.imshow("Image", mask_eroded)
+                    if cv2.waitKey(1) == ord("q"):
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        raise asyncio.CancelledError(
+                            "Остановка процесса формирования изображений"
+                        )
                 except Exception as e:
                     print(e)
                     pass
@@ -145,7 +203,7 @@ async def reader(
             try:
                 await process.wait()
             except TimeoutError:
-                print("Вызов ffpeg не может завершиться")
+                process.kill()
             print("Процесс формирования изображений отменен")
             break
         except Exception as e:
@@ -184,6 +242,51 @@ async def send_stop_messages(websocket: websockets.ClientConnection) -> None:
         print("Отправка остановчного сообщения на сервер ТТК отменена")
 
 
+async def set_ffmpeg() -> asyncio.subprocess.Process:
+    print("Запуск процесса ffmpeg")
+    process_ffmpeg = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-probesize",
+        "250K",
+        "-analyzeduration",
+        "1M",
+        "-f",
+        "mp4",
+        "-c:v",
+        "h264",
+        "-re",
+        "-i",
+        "pipe:0",
+        "-b:v",
+        "1000k",
+        "-vf",
+        "setrange=limited",
+        "-f",
+        "rawvideo",
+        "-c:v",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s:v",
+        str(width) + "x" + str(height),
+        "-r",
+        "25",
+        "-n",
+        "-an",
+        "-movflags",
+        "frag_keyframe+empty_moov+faststart+default_base_moof",
+        "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    print("Процесс ffmpeg запущен")
+    # Проверяем, что процесс ffmpeg запущен
+    return process_ffmpeg
+
+
 # Оснавная функция транскоддера
 async def process_video() -> None:
     try:
@@ -198,44 +301,7 @@ async def process_video() -> None:
                 uri_ws + json_data["token_value"]
             ) as websocket:
                 print("Подключение к серверу ТТК осуществлено")
-                process_ffmpeg = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-probesize",
-                    "250K",
-                    "-analyzeduration",
-                    "1M",
-                    "-f",
-                    "mp4",
-                    "-c:v",
-                    "h264",
-                    "-re",
-                    "-i",
-                    "pipe:0",
-                    "-b:v",
-                    "1000k",
-                    "-vf",
-                    "setrange=limited",
-                    "-f",
-                    "rawvideo",
-                    "-c:v",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "bgr24",
-                    "-s:v",
-                    "704x576",
-                    "-r",
-                    "25",
-                    "-n",
-                    "-an",
-                    "-movflags",
-                    "frag_keyframe+empty_moov+faststart+default_base_moof",
-                    "pipe:1",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                )
+                process_ffmpeg = await set_ffmpeg()
                 receive_task = asyncio.create_task(
                     receive_messages(websocket, process_ffmpeg)
                 )  # Создаем задачу по получению сообщений
@@ -251,6 +317,7 @@ async def process_video() -> None:
                     await asyncio.gather(
                         receive_task, response_task, return_exceptions=True
                     )  # Запускаем задачу по получению сообщений
+                    cv2.destroyAllWindows()
                     print("Получение сообщений от сервера ТТК остановлено")
                     print("Запускаем процесс остановки сервера")
                     # get all tasks
