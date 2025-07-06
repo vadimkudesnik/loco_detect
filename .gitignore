@@ -8,6 +8,11 @@ wheels/
 frames/
 *.egg-info
 uv.lock
+.mypy_cache/
 
 # Virtual environments
 .venv
+ffmpeg/
+runs/
+weights/
+nv-codec-headers/

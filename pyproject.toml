@@ -6,6 +6,9 @@ readme = "README.md"
 license = "LICENSE.md"
 requires-python = "==3.12.*"
 dependencies = [
+    "aiodns>=3.5.0",
+    "aiohttp[speedups]>=3.12.13",
+    "asyncio-simple-http-server>=0.0.8",
     "av>=14.4.0",
     "fastapi[standard]>=0.115.12",
     "ffmpeg-python>=0.2.0",
@@ -17,6 +20,8 @@ dependencies = [
     "pillow>=11.2.1",
     "pydantic>=2.11.5",
     "pynput>=1.8.1",
+    "pyqt5>=5.15.11",
+    "pyqt6>=6.9.1",
     "taskiq>=0.11.17",
     "taskiq-aio-pika>=0.4.2",
     "tensorflow>=2.19.0",
@@ -34,5 +39,5 @@ dev = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["imutils.*"]
+module = ["imutils.*", "ultralytics.*"]
 follow_untyped_imports = true

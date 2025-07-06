@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --script
+#!/usr/bin/env -S uv run --scripts
 
 # /// script
 #
@@ -7,15 +7,22 @@
 # Это программа транскоддер которая получает данные с сервера ТТК и направляет клиенту
 
 import asyncio
+import io
 import json
 import pickle
-import signal
 import uuid
+from typing import Any, AsyncGenerator, Optional
 
-import cv2
 import numpy as np
 import requests
+import uvicorn
 import websockets
+from fastapi import FastAPI
+from fastapi.requests import Request
+from fastapi.responses import StreamingResponse
+from fastapi.templating import Jinja2Templates
+from PIL import Image
+from ultralytics import YOLO
 
 params_read = "parameters.pickled"
 try:
@@ -80,58 +87,77 @@ json_camera_stop_string = (
 height = int(str(parameters["height"]))
 width = int(str(parameters["width"]))
 
+model = YOLO(model="yolo11n.pt", verbose=False)  # Загрузка модели YOLO
+
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
+
+
+process_ffmpeg_in: Optional[asyncio.subprocess.Process] = None
+process_ffmpeg_out: Optional[asyncio.subprocess.Process] = None
+websocket: Optional[websockets.ClientConnection] = None
+
+
+@app.get("/")
+def index(request: Request) -> Any:
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/video_feed")
+async def video_feed() -> StreamingResponse:
+    return StreamingResponse(
+        read_stream(), media_type="multipart/x-mixed-replace;boundary=frame"
+    )
+
 
 # функция получения сообщений от ТТК сервера и передачи их на клиент
-async def receive_messages(
-    websocket: websockets.ClientConnection,  # соединение с ТТК
-    process: asyncio.subprocess.Process,
-) -> None:
+async def receive_messages() -> None:
+    global process_ffmpeg_in
+    global websocket
     print("Запуск процесса получения сообщений от ТТК")
-    assert isinstance(process.stdin, asyncio.StreamWriter)
+    if websocket is None:
+        print("Ошибка: websocket не инициализирован")
+        return
+    if process_ffmpeg_in is None or process_ffmpeg_in.stdin is None:
+        print(
+            "Ошибка: process_ffmpeg_in или process_ffmpeg_in.stdin не инициализированы"
+        )
+        return
     while True:
         try:
             message = await websocket.recv(False)  # Получаем сообщение от ТТК
             iD = message[3:39].decode("utf-8")  # Выделяем ID камеры из сообщения
             if iD == streamId:  # Сверяем ID камеры из сообщения с заданным
-                # Работу с файлом используем только в целях разработки
-                # binary_file = open(streamId + ".mp4", "ab")  # Открываем файл для записи
-                # binary_file.write(
-                #    message[47:]
-                # )  # Записываем в конец полученное сообщение без заголовка
-                # binary_file.close()  # Закрываем файл
-                # ------------------------
-                process.stdin.write(message[47:])
-                await process.stdin.drain()
+                process_ffmpeg_in.stdin.write(message[47:])
+                await process_ffmpeg_in.stdin.drain()
 
         except asyncio.CancelledError:
             print("Процесс получения сообщений от ТТК отменен")
-            await send_stop_messages(
-                websocket
-            )  # Отправляем на сервер ТТК сообщение о закрытии потока
+            if process_ffmpeg_in is not None and process_ffmpeg_in.stdin is not None:
+                await (
+                    send_stop_messages()
+                )  # Отправляем на сервер ТТК сообщение о закрытии потока
             break
         except Exception as e:
             print(f"Процесс получения сообщений от ТТК получил ошибку: {e}")
-            await send_stop_messages(websocket)
+            await send_stop_messages()
             break
-    if process.stdin.can_write_eof():
-        process.stdin.write_eof()
+    if process_ffmpeg_in.stdin.can_write_eof():
+        process_ffmpeg_in.stdin.write_eof()
 
-    process.stdin.close()
-    await process.stdin.wait_closed()
+    process_ffmpeg_in.stdin.close()
+    await process_ffmpeg_in.stdin.wait_closed()
 
 
-async def reader(
-    process: asyncio.subprocess.Process,
-) -> None:
-    assert isinstance(process.stdout, asyncio.StreamReader)
-    print("Запуск процесса формирования изображений")
-    index = 0
-    backSub = cv2.createBackgroundSubtractorMOG2(1000, 25, True)
+async def read_stream() -> AsyncGenerator[bytes, Any]:
+    global process_ffmpeg_in
     while True:
         try:
             # Read raw video frame from stdout as bytes array.
-            in_bytes = await process.stdout.readexactly(height * width * 3)
-
+            if process_ffmpeg_in is None or process_ffmpeg_in.stdout is None:
+                print("Ошибка: process_ffmpeg_in или process_ffmpeg_in.stdout is None")
+                return
+            in_bytes = await process_ffmpeg_in.stdout.readexactly(height * width * 3)
             if not in_bytes:
                 break  # Break loop if no more bytes.
             else:
@@ -139,86 +165,89 @@ async def reader(
                 try:
                     in_frame = np.frombuffer(in_bytes, np.uint8).reshape(
                         [height, width, 3]
-                    )
-                    frame_out = in_frame.copy()
-                    frame_mid = in_frame.copy()
-                    start_point = (int(width / 2), 0)
+                    )[..., ::-1]
 
-                    # Ending coordinate, here (220, 220)
-                    # represents the bottom right corner of rectangle
-                    end_point = (int(width), 100)
+                    results = model.predict(
+                        in_frame, stream=False, conf=0.5, device="cuda", verbose=False
+                    )  # save predictions as labels
+                    if len(results) > 0:
+                        results[0].cuda()
+                        # results[0].show()
 
-                    # Blue color in BGR
-                    color = (255, 225, 225)
-                    cv2.rectangle(frame_mid, start_point, end_point, color, -1)
-                    fg_mask = backSub.apply(frame_mid)
-                    retval, mask_thresh = cv2.threshold(
-                        fg_mask, height / 20, height / 2, cv2.THRESH_BINARY
-                    )
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                    mask_eroded = cv2.morphologyEx(mask_thresh, cv2.MORPH_OPEN, kernel)
-                    contours, hierarchy = cv2.findContours(
-                        mask_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    min_contour_area = height / 10  # Define your minimum area threshold
-                    large_contours = [
-                        cnt
-                        for cnt in contours
-                        if cv2.contourArea(cnt) > min_contour_area
-                    ]
-                    for cnt in large_contours:
-                        x, y, w, h = cv2.boundingRect(cnt)
-                        cv2.rectangle(frame_out, (x, y), (x + w, y + h), (0, 0, 255), 1)
-                    if large_contours:
-                        cv2.rectangle(
-                            frame_out, (0, 0), (width, height), (0, 0, 255), 3
-                        )
+                        annotated_frame = np.array(
+                            results[0].plot(
+                                pil=True,
+                                labels=True,
+                                boxes=True,
+                                masks=False,
+                                probs=False,
+                                show=False,
+                                color_mode="instance",
+                            ),
+                            dtype=np.uint8,
+                        ).reshape([height, width, 3])
+                    else:
+                        annotated_frame = in_frame
+                    output = io.BytesIO()
 
-                    # cv2.putText(
-                    #    frame_out,
-                    #    "Status: {}".format(
-                    #        "Движение" if large_contours else "Спокойно"
-                    #    ),
-                    #    (10, 20),
-                    #    cv2.FONT_HERSHEY_COMPLEX,
-                    #    1,
-                    #    (0, 0, 255),
-                    #    1,
-                    #    cv2.LINE_4,
-                    # )  # вставляем текст
-                    # cv2.imwrite("frames/frame-" + str(index) + ".jpg", frame_out)
-                    index += 1
-                    cv2.imshow("Image", frame_out)
-                    # cv2.imshow("Image", mask_eroded)
-                    if cv2.waitKey(1) == ord("q"):
-                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                        raise asyncio.CancelledError(
-                            "Остановка процесса формирования изображений"
-                        )
-                except Exception as e:
-                    print(e)
-                    pass
+                    Image.fromarray(annotated_frame).save(output, format="JPEG")
+                    frame = output.getvalue()
+                    output.close()
+                    response = (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + f"{len(frame)}".encode() + b"\r\n"
+                        b"\r\n" + frame + b"\r\n\r\n"
+                    )
+                    try:
+                        yield response
+                    except Exception:
+                        print("Yield Exception")
+                        return
+
+                except Exception:
+                    output = io.BytesIO()
+                    pic = Image.new("RGB", (height, width), "white")
+                    pic.save(output, format="JPEG")
+                    frame = output.getvalue()
+                    output.close()
+                    response = (
+                        b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                        + frame
+                        + b"\r\n\r\n"
+                    )
+                    yield response
+
         except asyncio.CancelledError:
-            process.kill()
-            try:
-                await process.wait()
-            except TimeoutError:
-                process.kill()
+            if process_ffmpeg_in is not None:
+                process_ffmpeg_in.kill()
+                try:
+                    await process_ffmpeg_in.wait()
+                except TimeoutError:
+                    process_ffmpeg_in.kill()
             print("Процесс формирования изображений отменен")
             break
         except Exception as e:
             print(f"Процесс формирования изображений получил ошибку: {e}")
-    print("Процесс формирования изображений завершен")
+            output = io.BytesIO()
+            pic = Image.new("RGB", (height, width), "white")
+            pic.save(output, format="JPEG")
+            frame = output.getvalue()
+            output.close()
+            response = (
+                b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n\r\n"
+            )
+            yield response
 
 
 # функция отправки стартового сообщения на сервер ТТК
-async def send_messages(websocket: websockets.ClientConnection) -> None:
+async def send_messages() -> None:
+    global websocket
+    if websocket is None:
+        print("Ошибка: websocket не инициализирован")
+        return
     try:
         print("Отправка стартового сообщения на сервер ТТК")
-        # Работу с файлом используем только в целях разработки
-        # if os.path.exists(streamId + ".mp4"):
-        #    os.remove(streamId + ".mp4")
-        # ------------------------
         await websocket.send(
             json_camera_string
         )  # Отправка стартового сообщения на сервер ТТК
@@ -226,11 +255,15 @@ async def send_messages(websocket: websockets.ClientConnection) -> None:
         await asyncio.sleep(0)  # передача управления циклу event
     except websockets.exceptions.ConnectionClosed:
         print("Отправка стартового сообщения на сервер ТТК отменена")
-        signal.raise_signal(signal.SIGINT)
+        return
 
 
 # функция отправки остановочного сообщения на сервер ТТК
-async def send_stop_messages(websocket: websockets.ClientConnection) -> None:
+async def send_stop_messages() -> None:
+    global websocket
+    if websocket is None:
+        print("Ошибка: websocket не инициализирован")
+        return
     try:
         print("Отправка остановочного сообщения на сервер ТТК")
         await websocket.send(
@@ -240,28 +273,36 @@ async def send_stop_messages(websocket: websockets.ClientConnection) -> None:
         await asyncio.sleep(0)  # передача управления циклу event
     except websockets.exceptions.ConnectionClosed:
         print("Отправка остановчного сообщения на сервер ТТК отменена")
+        return
 
 
-async def set_ffmpeg() -> asyncio.subprocess.Process:
+async def set_ffmpeg_in() -> None:
+    global process_ffmpeg_in
     print("Запуск процесса ffmpeg")
-    process_ffmpeg = await asyncio.create_subprocess_exec(
+    process_ffmpeg_in = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
+        "-hwaccel",
+        "cuda",
         "-probesize",
-        "250K",
+        "1M",
         "-analyzeduration",
         "1M",
         "-f",
         "mp4",
         "-c:v",
-        "h264",
+        "h264_cuvid",
+        "-r",
+        "25",
         "-re",
         "-i",
         "pipe:0",
         "-b:v",
-        "1000k",
+        "5M",
+        "-bufsize",
+        "5M",
         "-vf",
         "setrange=limited",
         "-f",
@@ -282,13 +323,37 @@ async def set_ffmpeg() -> asyncio.subprocess.Process:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
     )
-    print("Процесс ffmpeg запущен")
-    # Проверяем, что процесс ffmpeg запущен
-    return process_ffmpeg
+    print("Процесс ffmpeg_in запущен")
+
+
+async def start_server() -> None:
+    config = uvicorn.Config(app=app, host="0.0.0.0", port=8080, access_log=False)
+    server = uvicorn.Server(config=config)
+    try:
+        await server.serve()
+    except asyncio.CancelledError:
+        server.force_exit = True
+        try:
+            await server.shutdown()
+        except Exception as e:
+            print(f"Процесс Unicorn сообщений получил ошибку: {e}")
+            return
+        print("Сервер остановлен")
+        return
+    except Exception as error:
+        server.force_exit = True
+        try:
+            await server.shutdown()
+        except Exception as e:
+            print(f"Процесс Unicorn сообщений получил ошибку: {e}")
+            return
+        print(f"Ошибка сервера Unicorn: {error}")
+        return
 
 
 # Оснавная функция транскоддера
 async def process_video() -> None:
+    global websocket
     try:
         print("Начало запуска процесса транскоддирования")
         print("Получение токена от сервера ТТК")
@@ -297,61 +362,58 @@ async def process_video() -> None:
         print("Получен токен:" + json_data["token_value"])
         print("Подключаемся к серверу ТТК")
         try:
-            async with websockets.connect(
-                uri_ws + json_data["token_value"]
-            ) as websocket:
-                print("Подключение к серверу ТТК осуществлено")
-                process_ffmpeg = await set_ffmpeg()
-                receive_task = asyncio.create_task(
-                    receive_messages(websocket, process_ffmpeg)
-                )  # Создаем задачу по получению сообщений
+            websocket = await websockets.connect(
+                uri_ws + json_data["token_value"],
+                ping_interval=None,
+                ping_timeout=None,
+            )  # Подключаемся к серверу ТТК
 
-                response_task = asyncio.create_task(
-                    reader(process_ffmpeg)
-                )  # Создаем задачу по получению сообщений
+            print("Подключение к серверу ТТК осуществлено")
 
-                print("Запускаем процесс обмена сообщениями")
-                try:
-                    await send_messages(websocket)  # Отправляем стартовое сообщение
-                    print("Процесс обмена сообщениями запущен")
-                    await asyncio.gather(
-                        receive_task, response_task, return_exceptions=True
-                    )  # Запускаем задачу по получению сообщений
-                    cv2.destroyAllWindows()
-                    print("Получение сообщений от сервера ТТК остановлено")
-                    print("Запускаем процесс остановки сервера")
-                    # get all tasks
-                    tasks = asyncio.all_tasks()
-                    # cancel all tasks
-                    for task in tasks:
-                        # request the task cancel
-                        print(task.get_name())
-                        task.cancel()
-                    print("Все задачи удалены")
-                except asyncio.CancelledError:
-                    await websocket.close()
+            await set_ffmpeg_in()
 
-                    print("Получение сообщений от сервера ТТК отменено")
-                except Exception as e:
-                    await websocket.close()
+            receive_task = asyncio.create_task(
+                receive_messages()
+            )  # Создаем задачу по получению сообщений
 
-                    print(f"Ошибка получения сообщений от сервера ТТК: {e}")
+            server_task = asyncio.create_task(start_server())
+
+            print("Запускаем процесс обмена сообщениями")
+
+            try:
+                await send_messages()  # Отправляем стартовое сообщение
+                print("Процесс обмена сообщениями запущен")
+
+                await asyncio.gather(
+                    receive_task, server_task, return_exceptions=True
+                )  # Запускаем задачу по получению сообщений
+
+                print("Получение сообщений от сервера ТТК остановлено")
+                print("Запускаем процесс остановки сервера")
+                tasks = asyncio.all_tasks()
+                for task in tasks:
+                    print(task.get_name())
+                    task.cancel()
+                print("Все задачи удалены")
+            except asyncio.CancelledError:
+                await websocket.close()
+                print("Получение сообщений от сервера ТТК отменено")
+            except Exception as e:
+                await websocket.close()
+                print(f"Ошибка получения сообщений от сервера ТТК: {e}")
+                return
         except asyncio.CancelledError:
-            await websocket.close()
-
             print("Процесс транскодирования сообщений отменен")
+            return
         except Exception as e:
-            await websocket.close()
-
             print(f"Процесс транскодирования сообщений получил ошибку: {e}")
+            return
     except asyncio.CancelledError:
-        await websocket.close()
-
         print("Процесс транскодирования сообщений отменен")
+        return
     except Exception as e:
-        await websocket.close()
-
         print(f"Процесс транскодирования сообщений получил ошибку: {e}")
+        return
 
 
 async def main() -> None:
@@ -360,9 +422,11 @@ async def main() -> None:
 
     except asyncio.CancelledError:
         print("Приложение остановлено")
+        return
 
     except Exception as e:
         print(f"Приложение получило ошибку: {e}")
+        return
 
 
 if __name__ == "__main__":
