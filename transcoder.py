@@ -317,8 +317,6 @@ async def set_ffmpeg_in() -> None:
         "25",
         "-n",
         "-an",
-        "-movflags",
-        "frag_keyframe+empty_moov+faststart+default_base_moof",
         "pipe:1",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
